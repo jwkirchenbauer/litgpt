@@ -1,5 +1,7 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
+from jsonargparse import CLI, set_config_read_mode, set_docstring_parse_options
+
 import math
 import pprint
 import time
@@ -46,7 +48,7 @@ from litgpt.utils import (
 
 
 def setup(
-    model_name: str,
+    model_name: Optional[str] = None,
     model_config: Optional[Config] = None,
     out_dir: Path = Path("out/pretrain"),
     precision: Literal["bf16-true", "bf16-mixed", "32-true", None] = None,
@@ -99,6 +101,8 @@ def setup(
         logger_name: The name of the logger to send metrics to.
         seed: The random seed to use for reproducibility.
     """
+    assert model_name is not None, "Most provide either `model_name` or `model_config`."
+
     if model_name == "list":
         available_models = "\n".join(sorted(name_to_config))
         print(f"Available values:\n{available_models}")
@@ -210,7 +214,8 @@ def main(
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
-    model = torch.compile(model)
+    # model = torch.compile(model)
+    model = torch.compile(model, mode="max-autotune-no-cudagraphs")
     model = fabric.setup(model)
 
     extra_kwargs = {"fused": fabric.device.type == "cuda"}
@@ -321,6 +326,14 @@ def fit(
     max_tokens_per_device = train.max_tokens // fabric.world_size
     tokens_per_iter = train.micro_batch_size * model.max_seq_length
     max_iters = max_tokens_per_device // tokens_per_iter
+
+    fabric.print(
+        f"Max tokens for run: {train.max_tokens:,}\n"
+        f"Max tokens per device: {max_tokens_per_device:,}\n"
+        f"Tokens per iteration (per device): {tokens_per_iter:,}\n"
+        f"Resulting max iterations: {max_iters:,}"
+    )
+
     log_iter_interval = train.log_interval * train.gradient_accumulation_iters(devices, num_nodes)
     initial_iter = state["iter_num"]
     train_iterator = CycleIterator(train_dataloader)
@@ -524,3 +537,14 @@ def validate_args(train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resu
         issues.append("Can't provide both `--resume` and `--initial_checkpoint_dir`. Choose one.")
     if issues:
         raise ValueError("\n".join(issues))
+
+
+if __name__ == "__main__":
+    
+    set_docstring_parse_options(attribute_docstrings=True)
+    set_config_read_mode(urls_enabled=True)
+
+    torch.set_float32_matmul_precision("high")
+    
+    CLI(setup)
+
