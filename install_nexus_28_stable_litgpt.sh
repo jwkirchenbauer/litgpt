@@ -1,5 +1,8 @@
 # Complete, reproducible script to build and prepare environment
 
+# Exit immediately if a command exits with a non-zero status
+set -e
+
 REPO=$(pwd)
 
 # modify the installation path and env name if you want

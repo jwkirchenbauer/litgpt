@@ -385,6 +385,14 @@ def fit(
                 samples=(state["iter_num"] * train.micro_batch_size),
                 lengths=(state["iter_num"] * train.micro_batch_size * model.max_seq_length),
             )
+
+            max_memory_allocated_per_gpu = torch.cuda.max_memory_allocated(fabric.device) / 1024**3
+            max_memory_reserved_per_gpu = torch.cuda.max_memory_reserved(fabric.device) / 1024**3
+            torch.cuda.reset_peak_memory_stats(fabric.device)
+
+            toks_per_iter_per_device = train.micro_batch_size * model.max_seq_length
+            toks_per_sec_per_device = toks_per_iter_per_device / (t1 - iter_t0)
+
             metrics = {
                 "loss": loss,
                 "iter": state["iter_num"],
@@ -397,6 +405,9 @@ def fit(
                 "tokens": state["iter_num"] * train.micro_batch_size * model.max_seq_length,
                 "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
                 "learning_rate": lr,
+                "max_mem_allocated_per_gpu": max_memory_allocated_per_gpu,
+                "max_mem_reserved_per_gpu": max_memory_reserved_per_gpu,
+                "toks_per_sec_per_device": toks_per_sec_per_device,
             }
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
@@ -407,6 +418,8 @@ def fit(
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
                 f" remaining time: {timedelta(seconds=int(metrics['remaining_time']))!s}"
+                f" | max mem (alloc/reserv): {metrics['max_mem_allocated_per_gpu']:.2f}/{metrics['max_mem_reserved_per_gpu']:.2f} GB |"
+                f" toks/sec/dev: {metrics['toks_per_sec_per_device'] :.2e}"
             )
 
             throughput_metrics = throughput.compute()
