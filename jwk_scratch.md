@@ -114,3 +114,10 @@ against lingua in parallel
 
 
 
+# setup on Tuo
+
+launch_exps_tuo.py
+
+
+
+
