@@ -14,6 +14,7 @@ from typing import Dict, Optional, Tuple, Union
 import lightning as L
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from lightning.fabric.strategies import FSDPStrategy
 from lightning.fabric.utilities.throughput import ThroughputMonitor, measure_flops
 from torch.utils.data import DataLoader
@@ -46,6 +47,56 @@ from litgpt.utils import (
     save_hyperparameters,
 )
 
+def logits_kl_div(pred_logits, target_logits):
+
+    normed_pred_probs = F.softmax(pred_logits.flatten(end_dim=-2), -1)
+    normed_target_probs = F.softmax(target_logits.flatten(end_dim=-2), -1)
+    log_pdivq = torch.log(normed_target_probs / normed_pred_probs)
+    p_log_pdivq = normed_target_probs * log_pdivq
+    kl = torch.sum(p_log_pdivq, dim=-1)
+    kl_bar = torch.mean(kl)
+    return kl_bar
+
+
+# @torch.compile
+# def soft_label_cross_entropy(pred_logits, target_logits):
+#     # BxLxV, BxLxV
+#     unnormed_pred_logits = pred_logits.flatten(end_dim=-2)
+#     normed_target_probs = F.softmax(target_logits.flatten(end_dim=-2), -1)
+#     # FIXME something seems odd here
+#     # F.kl_div(F.softmax(pred_logits.flatten(end_dim=-2), -1),normed_target_probs)
+#     # is very non-zero-y, and maybe this is why the CE is also non-zero-y
+#     return F.cross_entropy(
+#         unnormed_pred_logits,
+#         normed_target_probs,
+#     ) # 1x
+
+@torch.compile
+def logit_entropy(logits):
+    # BxLxV
+    p = F.softmax(logits.flatten(end_dim=-2), -1) # (BxL)xV
+    plogp = p * torch.log(p)
+    H_p = - 1.0 * torch.sum(plogp, dim=-1) # (BxL)x1
+    H_p_bar = torch.mean(H_p) # 1x
+    return H_p_bar
+
+# # @torch.compile
+# def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
+#     # BxLxV, BxLxV
+#     s_ce = soft_label_cross_entropy(logits_student, logits_teacher) # 1x
+#     h = logit_entropy(logits_student) # 1x
+#     loss = s_ce + beta * h
+#     return loss
+
+@torch.compile
+def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
+    # BxLxV, BxLxV
+    kl_teach_stud = logits_kl_div(logits_student, logits_teacher)
+    ent_teach = logit_entropy(logits_teacher)
+    ent_stud = logit_entropy(logits_student)
+    ce_teach_stud = ent_teach + kl_teach_stud
+    loss = ce_teach_stud + beta * ent_stud
+    return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
 
 def setup(
     model_name: Optional[str] = None,
@@ -144,7 +195,13 @@ def setup(
     )
 
     if devices * num_nodes > 1:
-        strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+        # strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+        
+        mesh = (num_nodes, devices)
+        # mesh = (num_nodes * devices, 1)
+        # mesh = ((num_nodes * devices) // 2, 2)
+        strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD", device_mesh=mesh)
+        # strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="NO_SHARD")
     else:
         strategy = "auto"
 
@@ -203,20 +260,31 @@ def main(
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=True):
         model = GPT(config)
+        model_teacher = GPT(config)
 
     initialize_weights(fabric, model, n_layer=config.n_layer, n_embd=config.n_embd)
+    initialize_weights(fabric, model_teacher, n_layer=config.n_layer, n_embd=config.n_embd)
 
     if train.tie_embeddings:
         model.transformer.wte.weight = model.lm_head.weight
+        model_teacher.transformer.wte.weight = model_teacher.lm_head.weight
     if train.max_seq_length:
         model.max_seq_length = train.max_seq_length
+        model_teacher.max_seq_length = train.max_seq_length
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
+    fabric.print(f"Total parameters teacher: {num_parameters(model_teacher):,}")
 
-    # model = torch.compile(model)
-    model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+    model = torch.compile(model) #, mode="max-autotune-no-cudagraphs")
     model = fabric.setup(model)
+
+    model_teacher = torch.compile(model_teacher) #, mode="max-autotune-no-cudagraphs")
+    model_teacher = fabric.setup(model_teacher)
+
+    # disable all teacher gradients
+    for param in model_teacher.parameters():
+        param.requires_grad = False
 
     extra_kwargs = {"fused": fabric.device.type == "cuda"}
     optimizer = instantiate_torch_optimizer(optimizer, model.parameters(), **extra_kwargs)
@@ -227,9 +295,11 @@ def main(
 
     if initial_checkpoint_dir:
         fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model)
+        fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model_teacher)
 
     state = {
         "model": model,
+        "model_teacher": model_teacher,
         "optimizer": optimizer,
         "train_dataloader": train_dataloader,
         "iter_num": 0,
@@ -254,6 +324,7 @@ def main(
         from torch.distributed.fsdp._runtime_utils import _root_pre_forward
 
         _root_pre_forward(model._forward_module._orig_mod, model._forward_module._orig_mod, [], {})
+        _root_pre_forward(model_teacher._forward_module._orig_mod, model_teacher._forward_module._orig_mod, [], {})
 
     fit(
         fabric=fabric,
@@ -302,6 +373,7 @@ def fit(
     num_nodes: int = 1,
 ) -> None:
     model = state["model"]
+    model_teacher = state["model_teacher"]
     optimizer = state["optimizer"]
 
     if eval.initial_validation:
@@ -361,11 +433,22 @@ def fit(
         input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
         targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
 
+        with torch.no_grad():
+            logits_teacher = model_teacher(input_ids).detach()
+            # loss_teacher = chunked_cross_entropy(logits, targets)
+            # fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
+
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids)
-            loss = chunked_cross_entropy(logits, targets)
+            # loss = chunked_cross_entropy(logits, targets)
+            
+            # loss = soft_ce_plus_ent_loss(logits, logits_teacher, beta=1.0)
+            # loss = soft_ce_plus_ent_loss(logits, logits_teacher, beta=0.0)
+            loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud = soft_ce_plus_ent_loss(logits, logits_teacher, beta=1.0)
+
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
+        
 
         running_loss.update(loss.detach())
 

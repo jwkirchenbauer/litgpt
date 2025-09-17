@@ -14,6 +14,7 @@ litgpt download Qwen/Qwen2.5-0.5B
 litgpt download Qwen/Qwen2.5-1.5B
 litgpt download Qwen/Qwen2.5-7B
 litgpt download meta-llama/Meta-Llama-3-8B
+litgpt download meta-llama/Meta-Llama-3.1-8B
 
 # 1 gpu (a4000)
 srun -N1 -n1 --ntasks-per-node=1 --gpus-per-task=1 --mem=50G --cpus-per-task=2 --unbuffered \

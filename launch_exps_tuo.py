@@ -5,8 +5,8 @@ from itertools import product, chain
 # LIST_CFGS = True
 LIST_CFGS = False
 
-# WRITE_ONLY = True
-WRITE_ONLY = False
+WRITE_ONLY = True
+# WRITE_ONLY = False
 
 LAUNCHER_FILEPATH = "/p/vast1/$USER/llnl-tools/launch_tuo.py"
 
@@ -23,8 +23,8 @@ EXTRA_COMPILE_FLAGS = True
 # LOG_RECOMPILES=False
 LOG_RECOMPILES = True
 
-# QOS = "pdebug"
-QOS = "pbatch"
+QOS = "pdebug"
+# QOS = "pbatch"
 BANK = "effml"
 TIME_LIMIT = 29
 REPETITIONS = 1
@@ -51,7 +51,9 @@ GPN = 4
 
 # Cfgs
 exp_list = [
-    ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Llama-3-8B", "checkpoints/meta-llama/Meta-Llama-3-8B", 1, GPN, 2, 8, 4096],
+    # ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Llama-3-8B", "checkpoints/meta-llama/Meta-Llama-3-8B", 1, GPN, 2, 8, 4096],
+    # ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 2, 8, 4096],
+    ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 1, 4, 4096],
 ]
 
 
@@ -79,6 +81,7 @@ for exp in final_exp_list:
         cfg,
         model_name,
         tok_dir,
+        init_ckpt_dir,
         nodes,
         gpn,
         mbsz,
@@ -95,7 +98,7 @@ for exp in final_exp_list:
     cli_args += f" --config={cfg}"
 
     model_str = model_name
-    cli_args += f" --model_name={model_name} --tokenizer_dir={tok_dir}"
+    cli_args += f" --model_name={model_name} --tokenizer_dir={tok_dir} --initial_checkpoint_dir={init_ckpt_dir}"
 
     bsz_str = f"mb{mbsz}-wb{wbsz}-sl{slen}"
     cli_args += f" --train.micro_batch_size={mbsz} --train.global_batch_size={wbsz} --train.max_seq_length={slen}"
