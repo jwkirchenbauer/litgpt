@@ -1,5 +1,7 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
+from jsonargparse import CLI, set_config_read_mode, set_docstring_parse_options
+
 import sys
 import time
 import warnings
@@ -551,10 +553,25 @@ def main(
         t = time.perf_counter() - t0
         for block in model.transformer.h:
             block.attn.kv_cache.reset_parameters()
-        fabric.print(tokenizer.decode(y))
+        fabric.print(f"#### BEGIN Prompt ####")
+        fabric.print(f"{prompt}")
+        fabric.print(f"#### END Prompt ####")
+        fabric.print(f"#### BEGIN Generation ####")
+        fabric.print(f"{tokenizer.decode(y)}")
+        fabric.print(f"#### END Generation ####")
         tokens_generated = y.size(0) - prompt_length
         fabric.print(
             f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr
         )
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    
+    set_docstring_parse_options(attribute_docstrings=True)
+    set_config_read_mode(urls_enabled=True)
+
+    torch.set_float32_matmul_precision("high")
+    
+    CLI(main)

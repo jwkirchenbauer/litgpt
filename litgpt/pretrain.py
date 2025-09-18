@@ -26,6 +26,7 @@ from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.data import DataModule, TinyLlama
 from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
+from litgpt.generate.base import generate as generate_fn
 from litgpt.utils import (
     _TORCH_EQUAL_2_7,
     _TORCH_EQUAL_2_8,
@@ -88,16 +89,20 @@ def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
     return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
 
 @torch.compile
-def mask_and_truncate(input_ids, target_ids, k=3, mask_id=128002, truncation_length=1024):
+def truncate_and_mask(input_ids=None, target_ids=None, k=3, mask_id=128002, truncation_length=1024):
+
+    prepared_target_ids = None
 
     bsz, orig_seq_len = input_ids.shape
-    assert orig_seq_len == target_ids.shape[-1] # check we're square
+    if target_ids is not None:
+        assert orig_seq_len == target_ids.shape[-1] # check we're square
     assert orig_seq_len >= truncation_length # check we have enough for the slice
     assert truncation_length > k # check slice vs k is valid
 
     # we assume that inputs and targets come in shifted by 1 from eachother
     prepared_input_ids = input_ids[:,:truncation_length]
-    prepared_target_ids = target_ids[:,:truncation_length]
+    if target_ids is not None:
+        prepared_target_ids = target_ids[:,:truncation_length]
     # as the directly prev input id for the first prediction will be at the same index as
     # that first prediction, we only need k-1 masked positions for performing k-tok prediction.
     if k-1 > 0:
@@ -342,6 +347,7 @@ def main(
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         out_dir=out_dir,
+        tokenizer=tokenizer,
         tokenizer_dir=tokenizer_dir,
         train=train,
         eval=eval,
@@ -375,6 +381,7 @@ def fit(
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
     out_dir: Path,
+    tokenizer: Tokenizer,
     tokenizer_dir: Optional[Path],
     train: TrainArgs,
     eval: EvalArgs,
@@ -385,11 +392,16 @@ def fit(
     optimizer = state["optimizer"]
 
     if eval.initial_validation:
+        generations = generative_validate(fabric, model, tokenizer, val_dataloader, max_iters=eval.max_iters)
+        fabric.print("Generations: ", [tup[1:] for tup in generations])
+
         val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
         val_loss = f"{val_loss:.3f}"
     else:
         fabric.print("Verifying settings ...")
         validate(fabric, model, val_dataloader, max_iters=2, verbose=False)  # sanity check
+        generative_validate(fabric, model, tokenizer, val_dataloader, max_iters=2) # sanity check
+        generations = "n/a"
         val_loss = "n/a"
 
     throughput = ThroughputMonitor(fabric, window_size=5)
@@ -439,16 +451,16 @@ def fit(
         iter_t0 = time.perf_counter()
 
         input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
-        targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
+        target_ids = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
 
-        beta=0.0
-        # beta=1.0
+        # beta=0.0
+        beta=1.0
         # k = 1
         k = 3
         mask_id = 128002
         truncation_length=1024
         orig_input_ids = input_ids.clone().detach()
-        input_ids, targets = mask_and_truncate(input_ids, targets, k=k, mask_id=mask_id, truncation_length=truncation_length)
+        input_ids, target_ids = truncate_and_mask(input_ids=input_ids, target_ids=target_ids, k=k, mask_id=mask_id, truncation_length=truncation_length)
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
@@ -540,6 +552,10 @@ def fit(
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
 
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval.interval == 0:
+            
+            generations = generative_validate(fabric, model, tokenizer, val_dataloader, max_iters=eval.max_iters)
+            fabric.print("Generations: ", [tup[1:] for tup in generations])
+            
             t0 = time.perf_counter()
             val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
             val_loss = val_loss.item()
@@ -555,6 +571,10 @@ def fit(
 
     # Final validation
     if eval.final_validation:
+
+        generations = generative_validate(fabric, model, tokenizer, val_dataloader, max_iters=eval.max_iters)
+        fabric.print("Generations: ", [tup[1:] for tup in generations])
+
         val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
         metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
         fabric.log_dict(metrics, step=state["iter_num"])
@@ -575,15 +595,79 @@ def validate(
         if k >= max_iters:
             break
         input_ids = batch[:, 0 : model.max_seq_length].contiguous().long()
-        targets = batch[:, 1 : (model.max_seq_length + 1)].contiguous().long()
+        target_ids = batch[:, 1 : (model.max_seq_length + 1)].contiguous().long()
         logits = model(input_ids)
-        loss = chunked_cross_entropy(logits, targets)
+        loss = chunked_cross_entropy(logits, target_ids)
         losses.append(loss)
 
     val_loss = torch.stack(losses).mean()
     model.train()
     fabric.barrier()
     return val_loss
+
+
+@torch.no_grad()
+def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer, val_dataloader: DataLoader, max_iters: int, verbose: bool = True, k_toks = 3):
+
+    fabric.barrier()
+    if verbose:
+        fabric.print("Generating ...")
+    model.eval()
+
+    generations = []
+
+    for k, batch in enumerate(val_dataloader):
+
+        if k >= max_iters:
+            break
+        input_ids = batch[:, 0 : model.max_seq_length].contiguous().long()
+        target_ids = batch[:, 1 : (model.max_seq_length + 1)].contiguous().long()
+
+        # outputs = batched_generate_fn( ... )
+        # for now we do this sequentially, but batching would be nice
+        for i, (row_in, row_tgt) in enumerate(zip(input_ids,target_ids)):
+
+            # FIXME, whatever we do here, goal will be to prepare the inputs exactly 
+            # as training rows are so these need to draw on global settings
+            mask_id = 128002
+            truncation_length=1024
+            
+            processed_row = truncate_and_mask(input_ids=row_in.unsqueeze(0), target_ids=row_tgt.unsqueeze(0), k=k_toks, mask_id=mask_id, truncation_length=truncation_length)
+            trunc_masked_row_in,trunc_masked_row_tgt = processed_row[0].squeeze(0), processed_row[1].squeeze(0)
+            
+            prompt = trunc_masked_row_in[:-(k_toks-1)]
+            gt_ids = trunc_masked_row_tgt[-k_toks:]
+
+            orig_len = len(trunc_masked_row_in) + 1
+
+            max_returned_tokens = len(prompt) + k_toks
+            assert max_returned_tokens == orig_len
+            assert max_returned_tokens == len(prompt) + len(gt_ids)
+            
+            # following some api.py commands to set up kv cache and things
+            model.clear_kv_cache()
+            model.set_kv_cache(batch_size=1, max_seq_length=max_returned_tokens, device=fabric.device)
+
+            for block in model.transformer.h:
+                block.attn.kv_cache.reset_parameters()
+
+            outputs = generate_fn(
+                model=model,
+                prompt=prompt,
+                max_returned_tokens=max_returned_tokens,
+                temperature=1.0,
+                top_k=None,
+                top_p=1.0,
+                # eos_id=tokenizer.eos_id,
+                eos_id=None, # NOTE this causes hangs as all ranks must continue generating in sync
+                include_prompt=False,
+            )
+            generations.append((tokenizer.decode(prompt),tokenizer.decode(gt_ids),tokenizer.decode(outputs)))
+
+    model.clear_kv_cache()
+    model.train()
+    fabric.barrier()
+    return generations
 
 
 def get_dataloaders(

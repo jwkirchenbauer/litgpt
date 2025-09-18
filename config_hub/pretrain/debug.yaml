@@ -68,19 +68,19 @@ train:
 # Evaluation-related arguments. See ``litgpt.args.EvalArgs`` for details
 eval:
   # Number of optimizer steps between evaluation calls (type: int, default: 1000)
-  interval: 1000
+  interval: 100
 
   # Number of tokens to generate (type: Optional[int], default: null)
   max_new_tokens:
 
   # Number of iterations (type: int, default: 100)
-  max_iters: 100
+  max_iters: 5
 
   # Whether to evaluate on the validation set at the beginning of the training
-  initial_validation: false
+  initial_validation: true
 
   # Whether to evaluate on the validation set at the end the training
-  final_validation: false
+  final_validation: true
 
 # Optimizer-related arguments
 optimizer:

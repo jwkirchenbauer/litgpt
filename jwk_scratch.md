@@ -121,4 +121,9 @@ launch_exps_tuo.py
 
 
 
+# set up generation utils
 
+python -u litgpt/generate/base.py checkpoints/meta-llama/Meta-Llama-3.1-8B \
+  --prompt "Hello, my name is"
+
+inline util is in pretrain file now and calls the base generate routine in a distributed manner
