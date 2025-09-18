@@ -42,7 +42,7 @@ train:
   micro_batch_size: 4
 
   # Number of iterations with learning rate warmup active (type: int, default: 2000)
-  lr_warmup_steps: 100
+  lr_warmup_steps: 1000
 
   # Number of epochs to train on (type: Optional[int], default: null)
   epochs:
@@ -88,7 +88,7 @@ optimizer:
 
   init_args:
     #   (type: float, default: 0.001)
-    lr: 6e-4
+    lr: 6e-5
 
     #   (type: float, default: 0.01)
     weight_decay: 0.1
@@ -97,6 +97,11 @@ optimizer:
     betas:
       - 0.9
       - 0.95
+  
+  # class_path: torch.optim.SGD
+  # init_args:
+  #   #   (type: float, default: 0.001)
+  #   lr: 6e-4
 
 # How many devices/GPUs to use. Uses all GPUs by default. (type: Union[int, str], default: auto)
 devices: auto

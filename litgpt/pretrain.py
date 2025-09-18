@@ -47,29 +47,15 @@ from litgpt.utils import (
     save_hyperparameters,
 )
 
+@torch.compile
 def logits_kl_div(pred_logits, target_logits):
-
-    normed_pred_probs = F.softmax(pred_logits.flatten(end_dim=-2), -1)
-    normed_target_probs = F.softmax(target_logits.flatten(end_dim=-2), -1)
-    log_pdivq = torch.log(normed_target_probs / normed_pred_probs)
-    p_log_pdivq = normed_target_probs * log_pdivq
+    pred_probs = F.softmax(pred_logits.flatten(end_dim=-2), -1)
+    target_probs = F.softmax(target_logits.flatten(end_dim=-2), -1)
+    log_pdivq = torch.log(target_probs / pred_probs)
+    p_log_pdivq = target_probs * log_pdivq
     kl = torch.sum(p_log_pdivq, dim=-1)
     kl_bar = torch.mean(kl)
     return kl_bar
-
-
-# @torch.compile
-# def soft_label_cross_entropy(pred_logits, target_logits):
-#     # BxLxV, BxLxV
-#     unnormed_pred_logits = pred_logits.flatten(end_dim=-2)
-#     normed_target_probs = F.softmax(target_logits.flatten(end_dim=-2), -1)
-#     # FIXME something seems odd here
-#     # F.kl_div(F.softmax(pred_logits.flatten(end_dim=-2), -1),normed_target_probs)
-#     # is very non-zero-y, and maybe this is why the CE is also non-zero-y
-#     return F.cross_entropy(
-#         unnormed_pred_logits,
-#         normed_target_probs,
-#     ) # 1x
 
 @torch.compile
 def logit_entropy(logits):
@@ -80,14 +66,6 @@ def logit_entropy(logits):
     H_p_bar = torch.mean(H_p) # 1x
     return H_p_bar
 
-# # @torch.compile
-# def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
-#     # BxLxV, BxLxV
-#     s_ce = soft_label_cross_entropy(logits_student, logits_teacher) # 1x
-#     h = logit_entropy(logits_student) # 1x
-#     loss = s_ce + beta * h
-#     return loss
-
 @torch.compile
 def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
     # BxLxV, BxLxV
@@ -95,8 +73,38 @@ def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
     ent_teach = logit_entropy(logits_teacher)
     ent_stud = logit_entropy(logits_student)
     ce_teach_stud = ent_teach + kl_teach_stud
+    
+    # NOTE testing reveals this is the bottleneck as expected
+    # but it takes a true 0.0 to not get any param mvmt
+    # even though step 0 of k=1 beta=0 run should give you 0 loss
+    # you eventually move as the logits arent exact
+    # loss = kl_teach_stud 
+    # loss = 0.0 * kl_teach_stud
+    # notably it is not graph leakage either as the untracked term
+    # doesn't mess up the 'true 0'
+    # loss = ent_teach + 0.0 * kl_teach_stud
+
     loss = ce_teach_stud + beta * ent_stud
     return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
+
+@torch.compile
+def mask_and_truncate(input_ids, target_ids, k=3, mask_id=128002, truncation_length=1024):
+
+    bsz, orig_seq_len = input_ids.shape
+    assert orig_seq_len == target_ids.shape[-1] # check we're square
+    assert orig_seq_len >= truncation_length # check we have enough for the slice
+    assert truncation_length > k # check slice vs k is valid
+
+    # we assume that inputs and targets come in shifted by 1 from eachother
+    prepared_input_ids = input_ids[:,:truncation_length]
+    prepared_target_ids = target_ids[:,:truncation_length]
+    # as the directly prev input id for the first prediction will be at the same index as
+    # that first prediction, we only need k-1 masked positions for performing k-tok prediction.
+    if k-1 > 0:
+        prepared_input_ids[:,-(k-1):] = mask_id
+    return prepared_input_ids, prepared_target_ids
+
+    
 
 def setup(
     model_name: Optional[str] = None,
@@ -433,19 +441,39 @@ def fit(
         input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
         targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
 
-        with torch.no_grad():
-            logits_teacher = model_teacher(input_ids).detach()
-            # loss_teacher = chunked_cross_entropy(logits, targets)
-            # fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
+        beta=0.0
+        # beta=1.0
+        # k = 1
+        k = 3
+        mask_id = 128002
+        truncation_length=1024
+        orig_input_ids = input_ids.clone().detach()
+        input_ids, targets = mask_and_truncate(input_ids, targets, k=k, mask_id=mask_id, truncation_length=truncation_length)
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            # loss = chunked_cross_entropy(logits, targets)
             
-            # loss = soft_ce_plus_ent_loss(logits, logits_teacher, beta=1.0)
-            # loss = soft_ce_plus_ent_loss(logits, logits_teacher, beta=0.0)
-            loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud = soft_ce_plus_ent_loss(logits, logits_teacher, beta=1.0)
+            # student prediction pass
+            logits = model(input_ids)
+
+            soft_stud_preds = logits[:,-k:]
+
+            with torch.no_grad():
+                # student output discretization
+                hard_stud_preds = torch.argmax(soft_stud_preds.clone().detach(), dim=-1)
+
+                stud_forcing_input_ids = orig_input_ids[:,:input_ids.shape[1]]
+                if k-1 > 0:
+                    stud_forcing_input_ids[:,-(k-1):] = hard_stud_preds[:,:(k-1)]
+            
+                # student forced teacher feedback pass
+                logits_teacher = model_teacher(stud_forcing_input_ids)
+                soft_teach_preds = logits_teacher[:,-k:]
+
+            loss_terms = soft_ce_plus_ent_loss(soft_stud_preds, soft_teach_preds, beta=beta)
+            
+            loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud = loss_terms
+            print(f"loss:{loss}, ce_teach_stud:{ce_teach_stud}, kl_teach_stud:{kl_teach_stud}, ent_teach:{ent_teach}, ent_stud:{ent_stud}")
 
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
         
@@ -453,7 +481,7 @@ def fit(
         running_loss.update(loss.detach())
 
         if not is_accumulating:
-            fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
+            grad_norm = fabric.clip_gradients(model, optimizer, max_norm=train.max_norm).item()
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
@@ -478,6 +506,7 @@ def fit(
 
             metrics = {
                 "loss": loss,
+                "grad_norm": grad_norm,
                 "iter": state["iter_num"],
                 "step": state["step_count"],
                 "epoch": train_iterator.epoch,
@@ -498,6 +527,7 @@ def fit(
                 f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
                 f" loss train: {metrics['loss']:.3f},"
                 f" val: {val_loss} |"
+                f" grad_norm: {grad_norm} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
                 f" remaining time: {timedelta(seconds=int(metrics['remaining_time']))!s}"

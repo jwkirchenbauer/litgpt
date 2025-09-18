@@ -26,7 +26,7 @@ LOG_RECOMPILES = True
 QOS = "pdebug"
 # QOS = "pbatch"
 BANK = "effml"
-TIME_LIMIT = 29
+TIME_LIMIT = 59
 REPETITIONS = 1
 DEPENDENCY = None
 
