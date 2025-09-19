@@ -89,7 +89,7 @@ def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
     return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
 
 @torch.compile
-def truncate_and_mask(input_ids=None, target_ids=None, k=3, mask_id=128002, truncation_length=1024):
+def truncate_and_mask(input_ids=None, target_ids=None, k=20, mask_id=128002, truncation_length=1024):
 
     prepared_target_ids = None
 
@@ -322,7 +322,9 @@ def main(
     resume = find_resume_path(resume, out_dir)
     if resume:
         fabric.print(f"Resuming training from {resume}")
+        teacher_model_ref = state.pop("model_teacher")
         fabric.load(resume, state)
+        state["model_teacher"] = teacher_model_ref
 
     train_time = time.perf_counter()
 
@@ -354,7 +356,9 @@ def main(
     )
 
     # Save final checkpoint
+    teacher_model_ref = state.pop("model_teacher")
     save_checkpoint(fabric, state, tokenizer_dir, out_dir / "final" / "lit_model.pth")
+    state["model_teacher"] = teacher_model_ref
 
     total_tokens = state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size
 
@@ -456,7 +460,8 @@ def fit(
         # beta=0.0
         beta=1.0
         # k = 1
-        k = 3
+        # k = 3
+        k = 20
         mask_id = 128002
         truncation_length=1024
         orig_input_ids = input_ids.clone().detach()
@@ -567,7 +572,9 @@ def fit(
             fabric.barrier()
 
         if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
+            teacher_model_ref = state.pop("model_teacher")
             save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
+            state["model_teacher"] = teacher_model_ref
 
     # Final validation
     if eval.final_validation:
@@ -607,7 +614,7 @@ def validate(
 
 
 @torch.no_grad()
-def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer, val_dataloader: DataLoader, max_iters: int, verbose: bool = True, k_toks = 3):
+def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer, val_dataloader: DataLoader, max_iters: int, verbose: bool = True, k_toks = 20):
 
     fabric.barrier()
     if verbose:
@@ -634,7 +641,13 @@ def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer
             
             processed_row = truncate_and_mask(input_ids=row_in.unsqueeze(0), target_ids=row_tgt.unsqueeze(0), k=k_toks, mask_id=mask_id, truncation_length=truncation_length)
             trunc_masked_row_in,trunc_masked_row_tgt = processed_row[0].squeeze(0), processed_row[1].squeeze(0)
-            
+
+            # sneak the SS pred in here for free
+            logits = model(trunc_masked_row_in.unsqueeze(0))
+            soft_preds = logits[:,-k_toks:]
+            ss_outputs = torch.argmax(soft_preds, dim=-1).squeeze(0)
+
+            # then proceed with the AR rollout
             prompt = trunc_masked_row_in[:-(k_toks-1)]
             gt_ids = trunc_masked_row_tgt[-k_toks:]
 
@@ -651,18 +664,18 @@ def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer
             for block in model.transformer.h:
                 block.attn.kv_cache.reset_parameters()
 
-            outputs = generate_fn(
+            ar_outputs = generate_fn(
                 model=model,
                 prompt=prompt,
                 max_returned_tokens=max_returned_tokens,
-                temperature=1.0,
-                top_k=None,
-                top_p=1.0,
+                temperature=0.0, # eg. greedy
+                top_k=None, # inactive value
+                top_p=1.0, # inactive value
                 # eos_id=tokenizer.eos_id,
                 eos_id=None, # NOTE this causes hangs as all ranks must continue generating in sync
                 include_prompt=False,
             )
-            generations.append((tokenizer.decode(prompt),tokenizer.decode(gt_ids),tokenizer.decode(outputs)))
+            generations.append((tokenizer.decode(prompt),tokenizer.decode(gt_ids),tokenizer.decode(ar_outputs),tokenizer.decode(ss_outputs)))
 
     model.clear_kv_cache()
     model.train()
@@ -743,8 +756,9 @@ def validate_args(train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resu
         for name in names:
             if getattr(args, name) is None:
                 issues.append(f"{__file__} requires the {name!r} argument. This is set in {args}")
-    if initial_checkpoint_dir and resume:
-        issues.append("Can't provide both `--resume` and `--initial_checkpoint_dir`. Choose one.")
+    # this should be safe to ignore given order of loading operations, and specifics of our setup
+    # if initial_checkpoint_dir and resume:
+    #     issues.append("Can't provide both `--resume` and `--initial_checkpoint_dir`. Choose one.")
     if issues:
         raise ValueError("\n".join(issues))
 
