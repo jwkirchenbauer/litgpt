@@ -58,6 +58,11 @@ def sample(
     if top_p < 0.0 or top_p > 1.0:
         raise ValueError(f"top_p must be in [0, 1], got {top_p}")
     logits = logits[0, -1]
+
+    # greedy decoding 
+    if (temperature == 0.0) and (top_k is None) and (top_p == 1.0):
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
     # optionally crop the logits to only the top k options
     if top_k is not None:
         v, i = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -72,7 +77,9 @@ def sample(
             logits = sample_top_p(logits, top_p)
         probs = torch.nn.functional.softmax(logits, dim=-1)
         return multinomial_num_samples_1(probs)
-    return torch.argmax(logits, dim=-1, keepdim=True)
+    
+    raise ValueError("Should not be here!")
+    # return torch.argmax(logits, dim=-1, keepdim=True)
 
 
 def next_token(

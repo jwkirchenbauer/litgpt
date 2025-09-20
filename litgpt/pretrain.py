@@ -89,7 +89,7 @@ def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
     return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
 
 @torch.compile
-def truncate_and_mask(input_ids=None, target_ids=None, k=20, mask_id=128002, truncation_length=1024):
+def truncate_and_mask(input_ids=None, target_ids=None, k=5, mask_id=128002, truncation_length=1024):
 
     prepared_target_ids = None
 
@@ -461,7 +461,7 @@ def fit(
         beta=1.0
         # k = 1
         # k = 3
-        k = 20
+        k = 5
         mask_id = 128002
         truncation_length=1024
         orig_input_ids = input_ids.clone().detach()
@@ -614,7 +614,7 @@ def validate(
 
 
 @torch.no_grad()
-def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer, val_dataloader: DataLoader, max_iters: int, verbose: bool = True, k_toks = 20):
+def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer, val_dataloader: DataLoader, max_iters: int, verbose: bool = True, k_toks = 5):
 
     fabric.barrier()
     if verbose:
@@ -648,7 +648,10 @@ def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer
             ss_outputs = torch.argmax(soft_preds, dim=-1).squeeze(0)
 
             # then proceed with the AR rollout
-            prompt = trunc_masked_row_in[:-(k_toks-1)]
+            if k_toks - 1 > 0:
+                prompt = trunc_masked_row_in[:-(k_toks-1)]
+            else:
+                prompt = trunc_masked_row_in
             gt_ids = trunc_masked_row_tgt[-k_toks:]
 
             orig_len = len(trunc_masked_row_in) + 1
