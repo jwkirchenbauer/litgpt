@@ -5,8 +5,8 @@ from itertools import product, chain
 # LIST_CFGS = True
 LIST_CFGS = False
 
-WRITE_ONLY = True
-# WRITE_ONLY = False
+# WRITE_ONLY = True
+WRITE_ONLY = False
 
 LAUNCHER_FILEPATH = "/p/vast1/$USER/llnl-tools/launch_tuo.py"
 
@@ -23,8 +23,8 @@ EXTRA_COMPILE_FLAGS = True
 # LOG_RECOMPILES=False
 LOG_RECOMPILES = True
 
-QOS = "pdebug"
-# QOS = "pbatch"
+# QOS = "pdebug"
+QOS = "pbatch"
 BANK = "effml"
 TIME_LIMIT = 59
 REPETITIONS = 1
@@ -36,6 +36,14 @@ DEPENDENCY = None
 # TIME_LIMIT = 1440
 # REPETITIONS = 5
 # DEPENDENCY = "afterany"
+
+
+SAVE_INTERVAL = 1000
+# EVAL_INTERVAL = 100
+EVAL_INTERVAL = 500
+INIT_EVAL = True
+# INIT_EVAL = False
+
 
 BASE_OUT_DIR = f"/p/vast1/kirchenb/singleshot-root/litgpt/outputs"
 
@@ -53,7 +61,14 @@ GPN = 4
 exp_list = [
     # ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Llama-3-8B", "checkpoints/meta-llama/Meta-Llama-3-8B", 1, GPN, 2, 8, 4096],
     # ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 2, 8, 4096],
-    ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 1, 4, 4096],
+    # ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 1, 4, 4096],
+    # a little scale testing
+    ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 4, 1*GPN*4, 32],
+    # ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 8, 1*GPN*8, 32],
+    ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 16, 1*GPN*16, 32],
+    # ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 32, 1*GPN*32, 32],
+    ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 64, 1*GPN*64, 32],
+    # ["litgpt/pretrain.py", "config_hub/pretrain/debug.yaml", "Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", "checkpoints/meta-llama/Meta-Llama-3.1-8B", 1, GPN, 128, 1*GPN*128, 32],
 ]
 
 
@@ -103,6 +118,9 @@ for exp in final_exp_list:
     bsz_str = f"mb{mbsz}-wb{wbsz}-sl{slen}"
     cli_args += f" --train.micro_batch_size={mbsz} --train.global_batch_size={wbsz} --train.max_seq_length={slen}"
 
+    # save eval stuff
+    cli_args += f" --train.save_interval={SAVE_INTERVAL} --eval.interval={EVAL_INTERVAL} --eval.initial_validation={INIT_EVAL}"
+
     # mod more things
     # ...
 
@@ -112,12 +130,14 @@ for exp in final_exp_list:
     )
 
     # put together the actual "train.py" command
-    custom_invocation = f"python -u {script} {cli_args}"
+    launch_out_dir = f"{BASE_OUT_DIR}/{BASE_RUN_NAME}"
+    full_out_dir = f"{launch_out_dir}/{run_name}"
+    custom_invocation = f"python -u {script} {cli_args} --out_dir={full_out_dir}"
 
     # make the complete launcher command
     command = f"""\
     python {LAUNCHER_FILEPATH} \
-        --output_dir={BASE_OUT_DIR}/{BASE_RUN_NAME} \
+        --output_dir={launch_out_dir} \
         --wandb_offline={WANDB_OFFLINE} \
         --rocm_version={ROCM_VERSION} \
         --rccl_installdir={RCCL_INSTALL_DIR} \

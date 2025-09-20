@@ -50,12 +50,13 @@ from litgpt.utils import (
 
 @torch.compile
 def logits_kl_div(pred_logits, target_logits):
-    pred_probs = F.softmax(pred_logits.flatten(end_dim=-2), -1)
-    target_probs = F.softmax(target_logits.flatten(end_dim=-2), -1)
-    log_pdivq = torch.log(target_probs / pred_probs)
+    # BxLxV, BxLxV
+    pred_probs = F.softmax(pred_logits.flatten(end_dim=-2), -1) # (BxL)xV
+    target_probs = F.softmax(target_logits.flatten(end_dim=-2), -1) # (BxL)xV
+    log_pdivq = torch.log(target_probs / pred_probs) # this could be a problem numerically
     p_log_pdivq = target_probs * log_pdivq
-    kl = torch.sum(p_log_pdivq, dim=-1)
-    kl_bar = torch.mean(kl)
+    kl = torch.sum(p_log_pdivq, dim=-1) # (BxL)x1
+    kl_bar = torch.mean(kl) # 1x
     return kl_bar
 
 @torch.compile
@@ -70,31 +71,23 @@ def logit_entropy(logits):
 @torch.compile
 def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
     # BxLxV, BxLxV
-    kl_teach_stud = logits_kl_div(logits_student, logits_teacher)
-    ent_teach = logit_entropy(logits_teacher)
-    ent_stud = logit_entropy(logits_student)
-    ce_teach_stud = ent_teach + kl_teach_stud
     
-    # debugging expressions
-    # NOTE testing reveals this is the bottleneck as expected
-    # but it takes a true 0.0 to not get any param mvmt
-    # even though step 0 of k=1 beta=0 run should give you 0 loss
-    # you eventually move as the logits arent exact
-    # loss = kl_teach_stud 
-    # loss = 0.0 * kl_teach_stud
-    # notably the eventualy param movement is not graph leakage through the untracked teach term
-    # it occurs even
-    # doesn't mess up the 'true 0'
-    # loss = ent_teach + 0.0 * kl_teach_stud
-    # if argmax is used to connect stud output to teach input, this errors, correctly
-    # loss = ent_teach
-
     # correct formula
-    loss = ce_teach_stud + beta * ent_stud
-    return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
+    # kl_teach_stud = logits_kl_div(logits_student, logits_teacher)
+    # ent_teach = logit_entropy(logits_teacher)
+    # ent_stud = logit_entropy(logits_student)
+    # ce_teach_stud = ent_teach + kl_teach_stud
+    # loss = ce_teach_stud + beta * ent_stud
+    # return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
+    
+    # also correct, but slightly more efficient, formula for optimization purposes
+    kl_teach_stud = logits_kl_div(logits_student, logits_teacher)
+    ent_stud = logit_entropy(logits_student)
+    loss = kl_teach_stud + beta * ent_stud
+    return loss, -1.0, kl_teach_stud, -1.0, ent_stud
 
 @torch.compile
-def truncate_and_mask(input_ids=None, target_ids=None, k=5, mask_id=128002, truncation_length=1024):
+def truncate_and_mask(input_ids=None, target_ids=None, k=1, mask_id=128002, truncation_length=32):
 
     prepared_target_ids = None
 
@@ -463,12 +456,13 @@ def fit(
         target_ids = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
 
         # beta=0.0
-        beta=1.0
-        # k = 1
+        # beta=1.0
+        beta=3.0
+        k = 1
         # k = 3
-        k = 5
+        # k = 5
         mask_id = 128002
-        truncation_length=1024
+        truncation_length=32
         orig_input_ids = input_ids.clone().detach()
         input_ids, target_ids = truncate_and_mask(input_ids=input_ids, target_ids=target_ids, k=k, mask_id=mask_id, truncation_length=truncation_length)
 
@@ -501,13 +495,19 @@ def fit(
             loss_terms = soft_ce_plus_ent_loss(soft_stud_preds, soft_teach_preds, beta=beta)
             loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud = loss_terms        
             print(f"loss:{loss}, ce_teach_stud:{ce_teach_stud}, kl_teach_stud:{kl_teach_stud}, ent_teach:{ent_teach}, ent_stud:{ent_stud}")
+            if torch.isnan(loss):
+                fabric.print("NaN loss encountered, exiting")
+                exit(1)
 
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
         running_loss.update(loss.detach())
 
         if not is_accumulating:
-            grad_norm = fabric.clip_gradients(model, optimizer, max_norm=train.max_norm).item()
+            grad_norm = fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
+            if torch.isnan(grad_norm):
+                fabric.print("NaN grad norm encountered, exiting")
+                exit(1)
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
@@ -623,7 +623,7 @@ def validate(
 
 
 @torch.no_grad()
-def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer, val_dataloader: DataLoader, max_iters: int, verbose: bool = True, k_toks = 5):
+def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer, val_dataloader: DataLoader, max_iters: int, verbose: bool = True, k_toks = 1):
 
     fabric.barrier()
     if verbose:
@@ -646,12 +646,12 @@ def generative_validate(fabric: L.Fabric, model: nn.Module, tokenizer: Tokenizer
             # FIXME, whatever we do here, goal will be to prepare the inputs exactly 
             # as training rows are so these need to draw on global settings
             mask_id = 128002
-            truncation_length=1024
+            truncation_length=32
             
             processed_row = truncate_and_mask(input_ids=row_in.unsqueeze(0), target_ids=row_tgt.unsqueeze(0), k=k_toks, mask_id=mask_id, truncation_length=truncation_length)
             trunc_masked_row_in,trunc_masked_row_tgt = processed_row[0].squeeze(0), processed_row[1].squeeze(0)
 
-            # sneak the SS pred in here for free
+            # sneak the SS pred in here "for free"
             logits = model(trunc_masked_row_in.unsqueeze(0))
             soft_preds = logits[:,-k_toks:]
             ss_outputs = torch.argmax(soft_preds, dim=-1).squeeze(0)
