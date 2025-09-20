@@ -75,16 +75,21 @@ def soft_ce_plus_ent_loss(logits_student, logits_teacher, beta=1.0):
     ent_stud = logit_entropy(logits_student)
     ce_teach_stud = ent_teach + kl_teach_stud
     
+    # debugging expressions
     # NOTE testing reveals this is the bottleneck as expected
     # but it takes a true 0.0 to not get any param mvmt
     # even though step 0 of k=1 beta=0 run should give you 0 loss
     # you eventually move as the logits arent exact
     # loss = kl_teach_stud 
     # loss = 0.0 * kl_teach_stud
-    # notably it is not graph leakage either as the untracked term
+    # notably the eventualy param movement is not graph leakage through the untracked teach term
+    # it occurs even
     # doesn't mess up the 'true 0'
     # loss = ent_teach + 0.0 * kl_teach_stud
+    # if argmax is used to connect stud output to teach input, this errors, correctly
+    # loss = ent_teach
 
+    # correct formula
     loss = ce_teach_stud + beta * ent_stud
     return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
 
@@ -470,30 +475,34 @@ def fit(
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             
-            # student prediction pass
+            # 1. student prediction pass
             logits = model(input_ids)
-
             soft_stud_preds = logits[:,-k:]
 
-            with torch.no_grad():
-                # student output discretization
-                hard_stud_preds = torch.argmax(soft_stud_preds.clone().detach(), dim=-1)
-
-                stud_forcing_input_ids = orig_input_ids[:,:input_ids.shape[1]]
-                if k-1 > 0:
-                    stud_forcing_input_ids[:,-(k-1):] = hard_stud_preds[:,:(k-1)]
+            # 2. student forced teacher feedback pass
             
-                # student forced teacher feedback pass
-                logits_teacher = model_teacher(stud_forcing_input_ids)
-                soft_teach_preds = logits_teacher[:,-k:]
+            # student output discretization
+            # hard_stud_preds = torch.argmax(soft_stud_preds.clone().detach(), dim=-1) # unnecessary
+            hard_stud_preds = torch.argmax(soft_stud_preds, dim=-1)
+            
+            # prep the student forcing sequence for the teacher
+            # starting with the original prefix for the sequence before mask positions
+            stud_forcing_input_ids = orig_input_ids[:,:input_ids.shape[1]]
+            if k-1 > 0:
+                # then 'cat' the student predictions to follow the prefix if there was more than 1 
+                stud_forcing_input_ids[:,-(k-1):] = hard_stud_preds[:,:(k-1)]
+            
+            # pass the prompt prefix and the student preds through the teacher
+            # with torch.no_grad(): # omitting as teach req's grads == False and used ~1gb more mem
+            logits_teacher = model_teacher(stud_forcing_input_ids)
+            soft_teach_preds = logits_teacher[:,-k:]
 
+            # 3. full loss calculation based on stud preds and stud-forced teacher preds
             loss_terms = soft_ce_plus_ent_loss(soft_stud_preds, soft_teach_preds, beta=beta)
-            
-            loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud = loss_terms
+            loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud = loss_terms        
             print(f"loss:{loss}, ce_teach_stud:{ce_teach_stud}, kl_teach_stud:{kl_teach_stud}, ent_teach:{ent_teach}, ent_stud:{ent_stud}")
 
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
-        
 
         running_loss.update(loss.detach())
 
